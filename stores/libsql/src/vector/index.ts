@@ -319,14 +319,14 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
 
       const translatedFilter = this.transformFilter(filter);
       const { sql: filterQuery, values: filterValues } = buildFilterQuery(translatedFilter);
-      filterValues.push(minScore);
-      filterValues.push(topK);
 
+      // Bind the query vector: libSQL re-parses a text literal on every vector_distance_cos() call,
+      // i.e. for every scanned row.
       const query = `
       WITH vector_scores AS (
         SELECT
           vector_id as id,
-          (1-vector_distance_cos(embedding, '${vectorStr}')) as score,
+          (1-vector_distance_cos(embedding, vector32(?))) as score,
           metadata
           ${includeVector ? ', vector_extract(embedding) as embedding' : ''}
         FROM ${parsedIndexName}
@@ -338,9 +338,10 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
       ORDER BY score DESC
       LIMIT ?`;
 
+      const args: InValue[] = [vectorStr, ...filterValues, minScore, topK];
       const result = await this.turso.execute({
         sql: query,
-        args: filterValues,
+        args,
       });
 
       return result.rows.map(({ id, score, metadata, embedding }) => ({

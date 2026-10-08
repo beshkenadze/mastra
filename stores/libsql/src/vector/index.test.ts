@@ -212,6 +212,80 @@ describe('LibSQLVector - Store Specific', () => {
     });
   });
 
+  describe('brute-force query without a DiskANN index', () => {
+    const bruteForceIndexName = 'bruteforce_test';
+    const tmpDir = path.join(os.tmpdir(), `libsql-bruteforce-test-${Date.now()}`);
+    let fileDb: LibSQLVector;
+
+    beforeAll(async () => {
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const url = `file:${path.join(tmpDir, 'test.db')}`;
+
+      const setupDb = new LibSQLVector({ url, id: 'libsql-bruteforce-setup' });
+      await setupDb.createIndex({ indexName: bruteForceIndexName, dimension: 1536, metric: 'cosine' });
+      await setupDb.upsert({
+        indexName: bruteForceIndexName,
+        vectors: [createVector(0), createVector(100), createVector(500), createVector(1000)],
+        metadata: [
+          { name: 'vec1', category: 'a' },
+          { name: 'vec2', category: 'b' },
+          { name: 'vec3', category: 'a' },
+          { name: 'vec4', category: 'b' },
+        ],
+      });
+      await setupDb.close();
+
+      // Without `<index>_vector_idx`, query() has to use the brute-force scan.
+      const client = createClient({ url });
+      await client.execute(`DROP INDEX ${bruteForceIndexName}_vector_idx`);
+      client.close();
+
+      fileDb = new LibSQLVector({ url, id: 'libsql-bruteforce-test' });
+    });
+
+    afterAll(async () => {
+      await fileDb.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    // Technical: the brute-force SQL used to inline the query vector as a JSON text literal, which libSQL
+    // re-parses on every vector_distance_cos() call (up to twice per scanned row), so scans took seconds. (#27880)
+    it('binds the query vector once instead of inlining it into the SQL', async () => {
+      const queryVector = createVector(0).map((value, i) => value + (i % 7) / 1000);
+      const vectorLiteral = `[${queryVector.join(',')}]`;
+      const turso = (fileDb as unknown as { turso: ReturnType<typeof createClient> }).turso;
+      const executeSpy = vi.spyOn(turso, 'execute');
+
+      try {
+        const results = await fileDb.query({
+          indexName: bruteForceIndexName,
+          queryVector,
+          topK: 10,
+          filter: { category: { $eq: 'a' } },
+          minScore: 0.5,
+          includeVector: true,
+        });
+
+        const vectorQueries = executeSpy.mock.calls
+          .map(([stmt]) => stmt as { sql: string; args: unknown[] })
+          .filter(stmt => stmt.sql.includes('vector_distance_cos'));
+        expect(vectorQueries.length).toBe(1);
+        expect(vectorQueries[0]!.sql).not.toContain('vector_top_k');
+        expect(vectorQueries[0]!.sql).toContain('vector32(?)');
+        expect(vectorQueries[0]!.sql).not.toContain(vectorLiteral);
+        expect(vectorQueries[0]!.args).toContain(vectorLiteral);
+
+        // Filter values, minScore and topK must still bind to the right placeholders.
+        expect(results.length).toBe(1);
+        expect(results[0]!.metadata).toEqual({ name: 'vec1', category: 'a' });
+        expect(results[0]!.score).toBeGreaterThan(0.5);
+        expect(results[0]!.vector).toEqual(createVector(0));
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+  });
+
   describe('minScore parameter', () => {
     it('should respect minimum score threshold', async () => {
       // First query without minScore to get all results
